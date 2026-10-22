@@ -2882,6 +2882,46 @@ def list_pending_receiver_ids_older_than(min_age_seconds: int) -> List[str]:
         return [row[0] for row in rows]
 
 
+def fail_orphaned_pending_messages(min_age_seconds: int) -> List[str]:
+    """Fail PENDING messages whose receiver terminal row is gone (#708).
+
+    The counterpart to the join in ``list_pending_receiver_ids_older_than``:
+    that join drops these rows so the sweep does not retry deliveries to
+    deleted agents, which leaves them claiming PENDING forever with no log
+    line, no state change, and nothing to tell them apart from a message that
+    is about to be delivered. They are not pending -- they are undeliverable,
+    and this says so.
+
+    ``create_inbox_message`` rejects an unknown receiver, and delivery requires
+    a row that ``list_pending_receiver_ids_older_than`` can join to, so a
+    missing receiver row makes the message undeliverable by every path
+    regardless of why the row is gone -- this does not depend on row deletion
+    being race-free. The same ``min_age_seconds`` grace window as the sweep
+    still applies.
+
+    Returns the ids of the messages that were failed, for logging.
+    """
+    cutoff = _utcnow() - timedelta(seconds=min_age_seconds)
+    with SessionLocal() as db:
+        orphaned = (
+            db.query(InboxModel)
+            .outerjoin(TerminalModel, TerminalModel.id == InboxModel.receiver_id)
+            .filter(
+                InboxModel.status == MessageStatus.PENDING.value,
+                InboxModel.created_at < cutoff,
+                TerminalModel.id.is_(None),
+            )
+            .all()
+        )
+        failed_ids = []
+        for message in orphaned:
+            message.status = MessageStatus.FAILED.value
+            failed_ids.append(str(message.id))
+        if failed_ids:
+            db.commit()
+        return failed_ids
+
+
 def delete_terminal(terminal_id: str) -> bool:
     """Delete terminal metadata."""
     with SessionLocal() as db:
@@ -2973,17 +3013,28 @@ def get_pending_messages(receiver_id: str, limit: int = 1) -> List[InboxMessage]
 
 
 def get_inbox_messages(
-    receiver_id: str, limit: int = 10, status: Optional[MessageStatus] = None
+    receiver_id: str,
+    limit: int = 10,
+    status: Optional[MessageStatus] = None,
+    sender_id: Optional[str] = None,
+    newest_first: bool = False,
 ) -> List[InboxMessage]:
-    """Get inbox messages with optional status filter ordered by created_at ASC (oldest first).
+    """Get inbox messages with optional status and sender filters.
+
+    Ordered by created_at ascending (oldest first) unless ``newest_first`` is set.
+    ``limit`` is applied after ordering. The defaults match historical callers,
+    including ``get_pending_messages``.
 
     Args:
         receiver_id: Terminal ID to get messages for
         limit: Maximum number of messages to return (default: 10)
         status: Optional filter by message status (None = all statuses)
+        sender_id: Optional filter by sender id (None = all senders)
+        newest_first: When True, order by created_at descending so ``limit``
+            keeps the newest messages. Defaults to False.
 
     Returns:
-        List of inbox messages ordered by creation time (oldest first)
+        List of inbox messages ordered by creation time
     """
     with SessionLocal() as db:
         query = db.query(InboxModel).filter(InboxModel.receiver_id == receiver_id)
@@ -2991,7 +3042,13 @@ def get_inbox_messages(
         if status is not None:
             query = query.filter(InboxModel.status == status.value)
 
-        messages = query.order_by(InboxModel.created_at.asc()).limit(limit).all()
+        if sender_id is not None:
+            query = query.filter(InboxModel.sender_id == sender_id)
+
+        created_at_order = (
+            InboxModel.created_at.desc() if newest_first else InboxModel.created_at.asc()
+        )
+        messages = query.order_by(created_at_order).limit(limit).all()
 
         return [
             InboxMessage(
